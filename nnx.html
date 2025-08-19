@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Number Nexus Deluxe</title>
+<style>
+  body { font-family: system-ui, Arial, sans-serif; margin:0; background:#0f1218; color:#f1f5f9; }
+  #nnx { text-align:center; max-width: 780px; margin: 0 auto; padding: 16px; }
+  .hud { display:flex; gap:1rem; justify-content:center; font-weight:600; margin:.5rem 0 1rem; }
+  #nnx-puzzle { font-size: clamp(1.6rem, 4.2vw, 2.4rem); margin: 12px 0 8px; color:#22d3ee; text-shadow:0 0 10px rgba(34,211,238,.7); animation:glow 1.6s infinite alternate; }
+  @keyframes glow { from{ text-shadow:0 0 10px rgba(34,211,238,.7);} to{ text-shadow:0 0 22px rgba(16,185,129,.9);} }
+  .controls { display:flex; gap:.5rem; justify-content:center; flex-wrap:wrap; margin: 8px 0 4px; }
+  input#nnx-guess { padding:.6rem .8rem; border:1px solid #334155; background:#111827; color:#e2e8f0; border-radius:.6rem; min-width:180px; }
+  button { padding:.6rem .9rem; border:0; border-radius:.8rem; cursor:pointer; background:#22d3ee; color:#031015; }
+  button:hover { filter:brightness(1.05); }
+  #nnx-result { min-height:2.2em; }
+  .card { background:#111827; border:1px solid #334155; border-radius:12px; padding:12px; }
+  .row { display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+  small#nnx-debug { opacity:.75; }
+</style>
+</head>
+<body>
+<div id="nnx">
+  <h2>🔥 Number Nexus Deluxe</h2>
+  <div class="hud">
+    <span id="nnx-level">Level 1</span>
+    <span id="nnx-timer">⏱ 0.0s</span>
+    <span id="nnx-streak">Streak: 0</span>
+  </div>
+
+  <div id="nnx-puzzle">Loading…</div>
+
+  <div class="controls">
+    <input id="nnx-guess" inputmode="decimal" placeholder="Your answer" aria-label="Your answer">
+    <button id="nnx-submit">Submit</button>
+    <button id="nnx-skip" title="Skip this puzzle (streak resets)">Skip</button>
+  </div>
+
+  <p id="nnx-result"></p>
+
+  <div class="row">
+    <div class="card" style="min-width:240px;">
+      <h3>🏆 Scoreboard</h3>
+      <div id="nnx-scores"></div>
+      <button id="nnx-reset">Reset Scores</button>
+    </div>
+  </div>
+
+  <p><small id="nnx-debug"></small></p>
+</div>
+
+<script>
+(function(){
+  // URLs
+  const RAW_URL = "https://raw.githubusercontent.com/hubsienda/nonexus/main/puzzles.json";
+  const CDN_URL = "https://cdn.jsdelivr.net/gh/hubsienda/nonexus@main/puzzles.json";
+
+  const CORRECTS_PER_LEVEL = 3;
+  const MAX_LEVEL_CAP = 99;
+  const FETCH_TIMEOUT_MS = 4000;
+
+  const MSGS_OK = [
+    "🧠 Brain upgraded to Premium Edition!",
+    "🚀 Faster than light… almost.",
+    "🍪 One smart cookie.",
+    "🤖 Outsmarted a robot today, did we?",
+    "🎉 Ding ding! Correct again.",
+    "🔥 You’re cooking with numbers!"
+  ];
+  const MSGS_FAIL = [
+    "🤡 That’s not it. Yet.",
+    "🪵 Close, but still in the woods.",
+    "🌀 Try another angle.",
+    "🧩 The piece doesn’t fit."
+  ];
+
+  // Instant local dataset (never hangs)
+  const BOOT_DATA = {
+    levels: {
+      "1": [
+        { numbers: [2,4,6,"?"], answer: 8, hint: "Even numbers" },
+        { numbers: [1,4,9,"?"], answer: 16, hint: "Perfect squares" },
+        { numbers: [5,10,20,"?"], answer: 40, hint: "Doubles" },
+        { numbers: [2,3,5,7,"?"], answer: 11, hint: "Prime sequence" }
+      ],
+      "2": [
+        { numbers: [3,6,9,15,"?"], answer: 24, hint: "Add +3, +3, +6, +9…" },
+        { numbers: [8,4,2,1,"?"], answer: 0.5, hint: "Halving" }
+      ],
+      "3": [
+        { numbers: [1,1,2,3,5,"?"], answer: 8, hint: "Fibonacci" }
+      ]
+    }
+  };
+
+  // State
+  let data = BOOT_DATA;
+  let level = parseInt(localStorage.getItem("nnx_level") || "1", 10);
+  let streak = parseInt(localStorage.getItem("nnx_streak") || "0", 10);
+  let bestTime = localStorage.getItem("nnx_bestTime") || "-";
+  let bestStreak = parseInt(localStorage.getItem("nnx_bestStreak") || "0", 10);
+  let highLevel = parseInt(localStorage.getItem("nnx_highLevel") || "1", 10);
+
+  let current = null, startTS = 0, timerInt = null;
+
+  // DOM
+  const elPuzzle = document.getElementById("nnx-puzzle");
+  const elGuess  = document.getElementById("nnx-guess");
+  const elSubmit = document.getElementById("nnx-submit");
+  const elSkip   = document.getElementById("nnx-skip");
+  const elResult = document.getElementById("nnx-result");
+  const elLevel  = document.getElementById("nnx-level");
+  const elTimer  = document.getElementById("nnx-timer");
+  const elStreak = document.getElementById("nnx-streak");
+  const elScores = document.getElementById("nnx-scores");
+  const elReset  = document.getElementById("nnx-reset");
+  const elDebug  = document.getElementById("nnx-debug");
+
+  const debug = (m) => { elDebug.textContent = String(m || ""); };
+
+  // Timer
+  function startTimer(){
+    clearInterval(timerInt);
+    startTS = Date.now();
+    timerInt = setInterval(()=>{
+      elTimer.textContent = "⏱ " + ((Date.now()-startTS)/1000).toFixed(1) + "s";
+    }, 100);
+  }
+  function stopTimer(){
+    clearInterval(timerInt);
+    return parseFloat(((Date.now()-startTS)/1000).toFixed(1));
+  }
+
+  // Scoreboard
+  function saveState(){
+    localStorage.setItem("nnx_level", String(level));
+    localStorage.setItem("nnx_streak", String(streak));
+    localStorage.setItem("nnx_bestTime", String(bestTime));
+    localStorage.setItem("nnx_bestStreak", String(bestStreak));
+    localStorage.setItem("nnx_highLevel", String(highLevel));
+  }
+  function updateScoreboard(){
+    elScores.innerHTML =
+      "Fastest Solve: " + bestTime + "s<br>" +
+      "Best Streak: " + bestStreak + "<br>" +
+      "Highest Level: " + highLevel;
+    elLevel.textContent = "Level " + level;
+    elStreak.textContent = "Streak: " + streak;
+  }
+
+  // Puzzles
+  function getLevelsAvailable(){
+    if (!data || !data.levels) return [];
+    return Object.keys(data.levels).map(n=>parseInt(n,10)).sort((a,b)=>a-b);
+  }
+  function getPoolForLevel(lv){
+    const levels = getLevelsAvailable();
+    if (!levels.length) return null;
+    const maxLv = Math.min(levels[levels.length-1], MAX_LEVEL_CAP);
+    const useLv = Math.min(lv, maxLv);
+    return data.levels[String(useLv)] || data.levels[String(levels[0])] || null;
+  }
+  function pickPuzzle(){
+    const pool = getPoolForLevel(level);
+    if (!pool || !pool.length) return null;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  function loadPuzzle(){
+    current = pickPuzzle();
+    if (!current){ elPuzzle.textContent = "No puzzles available."; return; }
+    elPuzzle.textContent = (current.numbers || []).join(", ");
+    elResult.textContent = "";
+    elGuess.value = "";
+    startTimer();
+    updateScoreboard();
+    elGuess.focus();
+    debug("");
+  }
+
+  function funOK(){ return MSGS_OK[Math.floor(Math.random()*MSGS_OK.length)]; }
+  function funFail(){ return MSGS_FAIL[Math.floor(Math.random()*MSGS_FAIL.length)]; }
+
+  function normaliseNumberText(s){ return s.replace(',', '.').trim(); }
+  function isCorrect(raw){
+    raw = normaliseNumberText(raw);
+    const ans = current.answer;
+    if (typeof ans === "number"){
+      const g = Number(raw);
+      return !Number.isNaN(g) && Math.abs(g-ans) < 1e-9;
+    }
+    return String(raw) === String(ans);
+  }
+
+  function handleCorrect(){
+    const took = stopTimer();
+    if (bestTime === "-" || took < parseFloat(bestTime)) bestTime = took.toFixed(1);
+    streak++;
+    if (streak > bestStreak) bestStreak = streak;
+    if (streak % CORRECTS_PER_LEVEL === 0){
+      level++; highLevel = Math.max(highLevel, level);
+      elResult.innerHTML = `✅ Correct! (${took.toFixed(1)}s) <br> ${funOK()} <br><strong>Level up!</strong>`;
+    } else {
+      elResult.innerHTML = `✅ Correct! (${took.toFixed(1)}s) <br> ${funOK()}`;
+    }
+    saveState();
+    setTimeout(loadPuzzle, 600);
+  }
+  function handleWrong(){
+    elResult.textContent = `❌ ${funFail()}  Hint: ${current.hint || "Look closely at the steps…"}`;
+    streak = 0; saveState(); updateScoreboard();
+  }
+
+  // Events
+  elSubmit.addEventListener("click", ()=>{
+    const raw = (elGuess.value || "").trim();
+    if (!raw){ elResult.textContent = "📝 Enter an answer."; return; }
+    isCorrect(raw) ? handleCorrect() : handleWrong();
+  });
+  elGuess.addEventListener("keydown", (e)=>{ if (e.key==="Enter") elSubmit.click(); });
+  elSkip.addEventListener("click", ()=>{ streak=0; saveState(); loadPuzzle(); });
+  elReset.addEventListener("click", ()=>{
+    if (!confirm("Reset local scores and progress?")) return;
+    level=1; streak=0; bestTime="-"; bestStreak=0; highLevel=1;
+    saveState(); updateScoreboard();
+  });
+
+  // Start immediately with local data
+  function startGame(){ updateScoreboard(); loadPuzzle(); }
+  startGame();
+
+  // Background fetch with timeout + dual fallback (RAW → CDN)
+  function timedFetch(url, ms){
+    const ctl = new AbortController();
+    const t = setTimeout(()=>ctl.abort(), ms);
+    return fetch(url, { cache:"no-store", signal: ctl.signal })
+      .then(r=>{ clearTimeout(t); if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); });
+  }
+  async function refreshRemote(){
+    try{ debug("Loading remote (RAW)…"); const j = await timedFetch(RAW_URL, FETCH_TIMEOUT_MS);
+      if (j && j.levels){ data = j; debug("Loaded from RAW."); return; }
+      throw new Error("RAW structure unexpected");
+    }catch(e1){
+      console.warn("RAW failed:", e1);
+      try{ debug("Loading remote (CDN)…"); const j2 = await timedFetch(CDN_URL, FETCH_TIMEOUT_MS);
+        if (j2 && j2.levels){ data = j2; debug("Loaded from CDN."); return; }
+        throw new Error("CDN structure unexpected");
+      }catch(e2){
+        console.warn("CDN failed:", e2); debug("Using built-in puzzles.");
+      }
+    }
+    // Adjust level bounds if remote has fewer levels
+    const levelsAvail = getLevelsAvailable();
+    if (levelsAvail.length){
+      const maxAvail = levelsAvail[levelsAvail.length - 1];
+      if (level > maxAvail) level = maxAvail;
+      highLevel = Math.max(highLevel, level);
+      saveState();
+    }
+  }
+  refreshRemote();
+
+  // Surface errors (helps diagnose)
+  window.addEventListener("error", e => debug("Script error: " + (e.message || e.type)));
+  window.addEventListener("unhandledrejection", e => debug("Promise error: " + (e.reason && e.reason.message ? e.reason.message : e.reason)));
+})();
+</script>
+</body>
+</html>
